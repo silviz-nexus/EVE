@@ -449,7 +449,7 @@ UI.Splash({
 task.wait(1.5)
 
 local Window = UI.New({
-    Title = "E.V.E Private",
+    Title = "E.V.E Private by Seniores",
     Subtitle = "Testing Phase",
     Theme = "Midnight",
     ShowUserInfo = true,

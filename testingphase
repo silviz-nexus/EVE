@@ -1,0 +1,711 @@
+--[[ E.V.E Private - XAN UI Ultimate Edition ]]
+
+-- Load XAN UI
+local UI = loadstring(game:HttpGet("https://xan.bar/init.lua"))()
+
+-- Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- Safe executor functions
+local mousemoverel = mousemoverel or function() end
+
+-- ========== CONNECTION MANAGER ==========
+local ConnectionManager = { connections = {}, groups = {} }
+
+function ConnectionManager:Add(name, connection, group)
+    if self.connections[name] then self:Disconnect(name) end
+    self.connections[name] = connection
+    if group then
+        self.groups[group] = self.groups[group] or {}
+        table.insert(self.groups[group], name)
+    end
+end
+
+function ConnectionManager:Disconnect(name)
+    if self.connections[name] then
+        pcall(function() self.connections[name]:Disconnect() end)
+        self.connections[name] = nil
+    end
+end
+
+function ConnectionManager:DisconnectGroup(group)
+    if self.groups[group] then
+        for _, name in ipairs(self.groups[group]) do
+            self:Disconnect(name)
+        end
+        self.groups[group] = nil
+    end
+end
+
+function ConnectionManager:DisconnectAll()
+    for name in pairs(self.connections) do self:Disconnect(name) end
+    self.groups = {}
+end
+
+-- ========== DRAWING POOL ==========
+local DrawingPool = { pools = {}, active = {} }
+
+function DrawingPool:Get(type)
+    self.pools[type] = self.pools[type] or {}
+    local drawing = table.remove(self.pools[type])
+    if not drawing then
+        local ok, result = pcall(function() return Drawing.new(type) end)
+        drawing = ok and result or nil
+    end
+    if drawing then self.active[drawing] = true end
+    return drawing
+end
+
+function DrawingPool:Release(drawing)
+    if not drawing then return end
+    pcall(function()
+        drawing.Visible = false
+        self.active[drawing] = nil
+        local type = drawing.ClassName or "Unknown"
+        self.pools[type] = self.pools[type] or {}
+        table.insert(self.pools[type], drawing)
+    end)
+end
+
+function DrawingPool:Destroy()
+    for _, pool in pairs(self.pools) do
+        for _, d in ipairs(pool) do pcall(function() d:Remove() end) end
+    end
+    for d in pairs(self.active) do pcall(function() d:Remove() end) end
+    self.pools, self.active = {}, {}
+end
+
+-- ========== UTILITIES ==========
+local Utils = {}
+
+function Utils:IsAlive(player)
+    if not player then return false end
+    local char = player.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    return hum and root and hum.Health > 0
+end
+
+function Utils:IsVisible(origin, target, ignoreList)
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = ignoreList or {}
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.IgnoreWater = true
+    
+    local direction = (target - origin)
+    local result = Workspace:Raycast(origin, direction, rayParams)
+    
+    if not result then return true end
+    for _, char in ipairs(ignoreList) do
+        if result.Instance:IsDescendantOf(char) then return true end
+    end
+    return false
+end
+
+-- ========== AIMBOT MANAGER (Arsenal-Style) ==========
+local AimbotManager = {
+    Enabled = false,
+    TeamCheck = true,
+    VisibleCheck = true,
+    FOV = 120,
+    Smoothness = 6,
+    AimPart = "Head",
+    isHoldingRMB = false,
+    connection = nil
+}
+
+function AimbotManager:GetClosestPlayer()
+    if not Utils:IsAlive(LocalPlayer) then return nil end
+    
+    local closestPlayer = nil
+    local shortestDistance = math.huge
+    local myHead = LocalPlayer.Character:FindFirstChild("Head")
+    if not myHead then return nil end
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        if not Utils:IsAlive(player) then continue end
+        if self.TeamCheck and player.Team == LocalPlayer.Team then continue end
+        
+        local char = player.Character
+        local targetPart = char:FindFirstChild(self.AimPart) or char:FindFirstChild("Head")
+        if not targetPart then continue end
+        
+        local distance = (myHead.Position - targetPart.Position).Magnitude
+        
+        if self.VisibleCheck then
+            if not Utils:IsVisible(Camera.CFrame.Position, targetPart.Position, {LocalPlayer.Character, char}) then
+                continue
+            end
+        end
+        
+        if distance < shortestDistance then
+            shortestDistance = distance
+            closestPlayer = {player = player, part = targetPart}
+        end
+    end
+    
+    return closestPlayer
+end
+
+function AimbotManager:AimAt(targetInfo)
+    if not targetInfo or not targetInfo.part then return end
+    local targetPart = targetInfo.part
+    if not targetPart.Parent then return end
+    
+    local targetCFrame = CFrame.new(Camera.CFrame.Position, targetPart.Position)
+    
+    if self.Smoothness <= 1 then
+        Camera.CFrame = targetCFrame
+    else
+        Camera.CFrame = Camera.CFrame:Lerp(targetCFrame, 1 / self.Smoothness)
+    end
+end
+
+function AimbotManager:Start()
+    if self.connection then return end
+    self.connection = RunService.RenderStepped:Connect(function()
+        if not self.Enabled or not self.isHoldingRMB then return end
+        local target = self:GetClosestPlayer()
+        if target then self:AimAt(target) end
+    end)
+end
+
+function AimbotManager:Stop()
+    if self.connection then
+        self.connection:Disconnect()
+        self.connection = nil
+    end
+end
+
+-- ========== ESP MANAGER ==========
+local ESPManager = {
+    Enabled = false,
+    Boxes = true,
+    Tracers = true,
+    Names = true,
+    Distance = true,
+    HealthBar = true,
+    TeamCheck = false,
+    MaxDistance = 2000,
+    objects = {}
+}
+
+function ESPManager:CreateESP(player)
+    if self.objects[player] then return end
+    
+    local box = DrawingPool:Get("Square")
+    local tracer = DrawingPool:Get("Line")
+    local name = DrawingPool:Get("Text")
+    local dist = DrawingPool:Get("Text")
+    local healthBar = DrawingPool:Get("Square")
+    local healthFill = DrawingPool:Get("Square")
+    
+    if not (box and tracer and name) then return end
+    
+    box.Thickness = 2
+    box.Filled = false
+    box.ZIndex = 2
+    box.Visible = false
+    
+    tracer.Thickness = 2
+    tracer.ZIndex = 1
+    tracer.Visible = false
+    
+    name.Size = 14
+    name.Center = true
+    name.Outline = true
+    name.ZIndex = 2
+    name.Visible = false
+    
+    dist.Size = 14
+    dist.Center = true
+    dist.Outline = true
+    dist.ZIndex = 2
+    dist.Visible = false
+    
+    healthBar.Thickness = 1
+    healthBar.Filled = false
+    healthBar.ZIndex = 2
+    healthBar.Visible = false
+    
+    healthFill.Thickness = 1
+    healthFill.Filled = true
+    healthFill.ZIndex = 3
+    healthFill.Visible = false
+    
+    self.objects[player] = {
+        Box = box,
+        Tracer = tracer,
+        Name = name,
+        Distance = dist,
+        HealthBar = healthBar,
+        HealthFill = healthFill
+    }
+end
+
+function ESPManager:UpdateESP(player, esp)
+    if not Utils:IsAlive(player) then
+        for _, v in pairs(esp) do if v.Visible then v.Visible = false end end
+        return
+    end
+    
+    local char = player.Character
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum then return end
+    
+    local myChar = LocalPlayer.Character
+    if not myChar or not myChar:FindFirstChild("HumanoidRootPart") then return end
+    
+    local distance = (myChar.HumanoidRootPart.Position - root.Position).Magnitude
+    if distance > self.MaxDistance then
+        for _, v in pairs(esp) do if v.Visible then v.Visible = false end end
+        return
+    end
+    
+    if self.TeamCheck and player.Team == LocalPlayer.Team then
+        for _, v in pairs(esp) do if v.Visible then v.Visible = false end end
+        return
+    end
+    
+    local screenPos, onScreen = Camera:WorldToViewportPoint(root.Position)
+    if not onScreen then return end
+    
+    local head = char:FindFirstChild("Head")
+    if not head then return end
+    
+    local headPos = Camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.5, 0))
+    local legPos = Camera:WorldToViewportPoint(root.Position - Vector3.new(0, 3, 0))
+    local height = math.abs(headPos.Y - legPos.Y)
+    local width = height / 2
+    
+    local color = (player.Team and player.Team.TeamColor.Color) or Color3.new(1, 1, 1)
+    
+    if self.Boxes then
+        esp.Box.Size = Vector2.new(width, height)
+        esp.Box.Position = Vector2.new(screenPos.X - width/2, screenPos.Y - height/2)
+        esp.Box.Color = color
+        esp.Box.Visible = true
+    else
+        esp.Box.Visible = false
+    end
+    
+    if self.Tracers then
+        esp.Tracer.From = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y)
+        esp.Tracer.To = Vector2.new(screenPos.X, screenPos.Y)
+        esp.Tracer.Color = color
+        esp.Tracer.Visible = true
+    else
+        esp.Tracer.Visible = false
+    end
+    
+    if self.Names then
+        esp.Name.Text = player.Name
+        esp.Name.Position = Vector2.new(screenPos.X, screenPos.Y - height/2 - 16)
+        esp.Name.Color = color
+        esp.Name.Visible = true
+    else
+        esp.Name.Visible = false
+    end
+    
+    if self.Distance then
+        esp.Distance.Text = string.format("[%dm]", math.floor(distance))
+        esp.Distance.Position = Vector2.new(screenPos.X, screenPos.Y + height/2 + 2)
+        esp.Distance.Color = color
+        esp.Distance.Visible = true
+    else
+        esp.Distance.Visible = false
+    end
+    
+    if self.HealthBar then
+        local healthPercent = hum.Health / hum.MaxHealth
+        esp.HealthBar.Size = Vector2.new(2, height)
+        esp.HealthBar.Position = Vector2.new(screenPos.X - width/2 - 6, screenPos.Y - height/2)
+        esp.HealthBar.Visible = true
+        
+        esp.HealthFill.Size = Vector2.new(2, height * healthPercent)
+        esp.HealthFill.Position = Vector2.new(screenPos.X - width/2 - 6, screenPos.Y - height/2 + (height * (1 - healthPercent)))
+        esp.HealthFill.Color = Color3.fromRGB(255, 0, 0):Lerp(Color3.fromRGB(0, 255, 0), healthPercent)
+        esp.HealthFill.Visible = true
+    else
+        esp.HealthBar.Visible = false
+        esp.HealthFill.Visible = false
+    end
+end
+
+function ESPManager:RemoveESP(player)
+    local esp = self.objects[player]
+    if not esp then return end
+    for _, v in pairs(esp) do DrawingPool:Release(v) end
+    self.objects[player] = nil
+end
+
+function ESPManager:Clear()
+    for player in pairs(self.objects) do self:RemoveESP(player) end
+end
+
+-- ========== MOVEMENT CONTROLLER ==========
+local MovementController = {}
+
+function MovementController:StartFly(speed, noclip)
+    local char = LocalPlayer.Character
+    if not char then return end
+    
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum then return end
+    
+    local bodyVel = Instance.new("BodyVelocity")
+    bodyVel.Velocity = Vector3.new(0, 0, 0)
+    bodyVel.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    bodyVel.Parent = root
+    
+    local bodyGyro = Instance.new("BodyGyro")
+    bodyGyro.P = 9e4
+    bodyGyro.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+    bodyGyro.CFrame = root.CFrame
+    bodyGyro.Parent = root
+    
+    hum.PlatformStand = true
+    
+    local keys = {W = false, A = false, S = false, D = false, Space = false, Shift = false}
+    
+    ConnectionManager:Add("FlyKeys1", UserInputService.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if input.KeyCode == Enum.KeyCode.W then keys.W = true
+        elseif input.KeyCode == Enum.KeyCode.A then keys.A = true
+        elseif input.KeyCode == Enum.KeyCode.S then keys.S = true
+        elseif input.KeyCode == Enum.KeyCode.D then keys.D = true
+        elseif input.KeyCode == Enum.KeyCode.Space then keys.Space = true
+        elseif input.KeyCode == Enum.KeyCode.LeftShift then keys.Shift = true
+        end
+    end), "Fly")
+    
+    ConnectionManager:Add("FlyKeys2", UserInputService.InputEnded:Connect(function(input)
+        if input.KeyCode == Enum.KeyCode.W then keys.W = false
+        elseif input.KeyCode == Enum.KeyCode.A then keys.A = false
+        elseif input.KeyCode == Enum.KeyCode.S then keys.S = false
+        elseif input.KeyCode == Enum.KeyCode.D then keys.D = false
+        elseif input.KeyCode == Enum.KeyCode.Space then keys.Space = false
+        elseif input.KeyCode == Enum.KeyCode.LeftShift then keys.Shift = false
+        end
+    end), "Fly")
+    
+    ConnectionManager:Add("FlyLoop", RunService.Heartbeat:Connect(function()
+        if noclip then
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then part.CanCollide = false end
+            end
+        end
+        
+        local moveVec = Vector3.new(0, 0, 0)
+        if keys.W then moveVec = moveVec + Camera.CFrame.LookVector end
+        if keys.S then moveVec = moveVec - Camera.CFrame.LookVector end
+        if keys.A then moveVec = moveVec - Camera.CFrame.RightVector end
+        if keys.D then moveVec = moveVec + Camera.CFrame.RightVector end
+        if keys.Space then moveVec = moveVec + Vector3.new(0, 1, 0) end
+        if keys.Shift then moveVec = moveVec - Vector3.new(0, 1, 0) end
+        
+        bodyVel.Velocity = moveVec * speed
+        bodyGyro.CFrame = Camera.CFrame
+    end), "Fly")
+end
+
+function MovementController:StopFly()
+    ConnectionManager:DisconnectGroup("Fly")
+    local char = LocalPlayer.Character
+    if not char then return end
+    
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then hum.PlatformStand = false end
+    
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if root then
+        for _, obj in ipairs(root:GetChildren()) do
+            if obj:IsA("BodyVelocity") or obj:IsA("BodyGyro") then obj:Destroy() end
+        end
+    end
+    
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then part.CanCollide = true end
+    end
+end
+
+-- ========== CREATE WINDOW ==========
+UI.Splash({
+    Title = "E.V.E Private",
+    Subtitle = "Loading...",
+    Duration = 1.5
+})
+
+task.wait(1.5)
+
+local Window = UI.New({
+    Title = "E.V.E Private",
+    Subtitle = "XAN UI Edition",
+    Theme = "Midnight",
+    ShowUserInfo = true,
+    ShowActiveList = true
+})
+
+-- ========== COMBAT TAB ==========
+local Combat = Window:AddTab("Combat", UI.Icons.Aimbot)
+
+Combat:AddSection("Aimbot")
+
+Combat:AddToggle("Enable Aimbot", {
+    Flag = "aim_enabled",
+    Default = false,
+    ShowInActiveList = true
+}, function(v)
+    AimbotManager.Enabled = v
+    if v then AimbotManager:Start() else AimbotManager:Stop() end
+end)
+
+Combat:AddToggle("Team Check", { Flag = "aim_team", Default = true }, function(v)
+    AimbotManager.TeamCheck = v
+end)
+
+Combat:AddToggle("Visible Check", { Flag = "aim_vis", Default = true }, function(v)
+    AimbotManager.VisibleCheck = v
+end)
+
+Combat:AddSlider("FOV Size", {
+    Min = 30,
+    Max = 800,
+    Default = 120,
+    Flag = "aim_fov"
+}, function(v)
+    AimbotManager.FOV = v
+end)
+
+Combat:AddSlider("Smoothness", {
+    Min = 1,
+    Max = 20,
+    Default = 6,
+    Flag = "aim_smooth"
+}, function(v)
+    AimbotManager.Smoothness = v
+end)
+
+Combat:AddDropdown("Aim Part", {"Head", "HumanoidRootPart", "UpperTorso"}, function(v)
+    AimbotManager.AimPart = v
+end)
+
+Combat:AddParagraph("Controls", "Hold RIGHT MOUSE BUTTON to aim at nearest enemy")
+
+-- ========== MOVEMENT TAB ==========
+local Movement = Window:AddTab("Movement", UI.Icons.Speed)
+
+Movement:AddSection("Flight")
+
+local flyEnabled = false
+Movement:AddToggle("Enable Fly", {
+    Flag = "fly_enabled",
+    Default = false,
+    ShowInActiveList = true
+}, function(v)
+    flyEnabled = v
+    if v then
+        MovementController:StartFly(UI.Flag("fly_speed") or 50, UI.Flag("fly_noclip") or true)
+    else
+        MovementController:StopFly()
+    end
+end)
+
+Movement:AddSlider("Fly Speed", {
+    Min = 10,
+    Max = 200,
+    Default = 50,
+    Flag = "fly_speed"
+}, function(v) end)
+
+Movement:AddToggle("Fly NoClip", { Flag = "fly_noclip", Default = true }, function(v) end)
+
+Movement:AddSection("Speed")
+
+Movement:AddToggle("Enable Speed", {
+    Flag = "speed_enabled",
+    Default = false,
+    ShowInActiveList = true
+}, function(v)
+    local char = LocalPlayer.Character
+    if char and char:FindFirstChildOfClass("Humanoid") then
+        char.Humanoid.WalkSpeed = v and (UI.Flag("speed_amount") or 50) or 16
+    end
+end)
+
+Movement:AddSlider("Speed Amount", {
+    Min = 16,
+    Max = 200,
+    Default = 50,
+    Flag = "speed_amount"
+}, function(v)
+    if UI.Flag("speed_enabled") then
+        local char = LocalPlayer.Character
+        if char and char:FindFirstChildOfClass("Humanoid") then
+            char.Humanoid.WalkSpeed = v
+        end
+    end
+end)
+
+Movement:AddSection("Miscellaneous")
+
+local infJump = false
+Movement:AddToggle("Infinite Jump", { Flag = "inf_jump" }, function(v) infJump = v end)
+
+local noclip = false
+Movement:AddToggle("NoClip", { Flag = "noclip" }, function(v) noclip = v end)
+
+-- ========== VISUALS TAB ==========
+local Visuals = Window:AddTab("Visuals", UI.Icons.ESP)
+
+Visuals:AddSection("ESP")
+
+Visuals:AddToggle("Enable ESP", {
+    Flag = "esp_enabled",
+    Default = false,
+    ShowInActiveList = true
+}, function(v)
+    ESPManager.Enabled = v
+    if not v then ESPManager:Clear() end
+end)
+
+Visuals:AddToggle("Boxes", { Flag = "esp_boxes", Default = true }, function(v) ESPManager.Boxes = v end)
+Visuals:AddToggle("Tracers", { Flag = "esp_tracers", Default = true }, function(v) ESPManager.Tracers = v end)
+Visuals:AddToggle("Names", { Flag = "esp_names", Default = true }, function(v) ESPManager.Names = v end)
+Visuals:AddToggle("Distance", { Flag = "esp_distance", Default = true }, function(v) ESPManager.Distance = v end)
+Visuals:AddToggle("Health Bar", { Flag = "esp_health", Default = true }, function(v) ESPManager.HealthBar = v end)
+Visuals:AddToggle("Team Check", { Flag = "esp_team" }, function(v) ESPManager.TeamCheck = v end)
+
+Visuals:AddSlider("Max Distance", {
+    Min = 500,
+    Max = 5000,
+    Default = 2000,
+    Flag = "esp_maxdist"
+}, function(v) ESPManager.MaxDistance = v end)
+
+-- ========== MISC TAB ==========
+local Misc = Window:AddTab("Misc", UI.Icons.Misc)
+
+Misc:AddButton("Full Bright", function()
+    local Lighting = game:GetService("Lighting")
+    Lighting.Brightness = 2
+    Lighting.ClockTime = 14
+    Lighting.FogEnd = 100000
+    Lighting.GlobalShadows = false
+    UI.Success("Full Bright", "Enabled!")
+end)
+
+Misc:AddButton("Anti-AFK", function()
+    ConnectionManager:Add("AntiAFK", LocalPlayer.Idled:Connect(function()
+        game:GetService("VirtualUser"):ClickButton2(Vector2.new())
+    end))
+    UI.Success("Anti-AFK", "Enabled!")
+end)
+
+-- ========== SETTINGS TAB ==========
+local Settings = Window:AddTab("Settings", UI.Icons.Settings)
+
+Settings:AddSection("Theme")
+Settings:CreateThemeSelector({ Name = "Theme" })
+
+Settings:AddSection("Config")
+Settings:AddButton("Save Config", function()
+    UI.Save("eve_config")
+    UI.Success("Saved!", "Config saved")
+end)
+
+Settings:AddButton("Load Config", function()
+    UI.Load("eve_config")
+    UI.Success("Loaded!", "Config loaded")
+end)
+
+Settings:AddDivider()
+Settings:AddDangerButton("Unload Script", function()
+    AimbotManager:Stop()
+    MovementController:StopFly()
+    ConnectionManager:DisconnectAll()
+    ESPManager:Clear()
+    DrawingPool:Destroy()
+    UI.Unload()
+end)
+
+-- ========== INPUT HANDLERS ==========
+ConnectionManager:Add("RMB_Press", UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        AimbotManager.isHoldingRMB = true
+    end
+end))
+
+ConnectionManager:Add("RMB_Release", UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        AimbotManager.isHoldingRMB = false
+    end
+end))
+
+ConnectionManager:Add("InfJump", UserInputService.JumpRequest:Connect(function()
+    if infJump then
+        local char = LocalPlayer.Character
+        if char and char:FindFirstChildOfClass("Humanoid") then
+            char.Humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end
+end))
+
+-- ========== MAIN LOOPS ==========
+local lastESP = 0
+
+ConnectionManager:Add("MainRender", RunService.RenderStepped:Connect(function()
+    local now = tick()
+    
+    -- ESP Update (60 FPS)
+    if ESPManager.Enabled and (now - lastESP) >= (1/60) then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                if not ESPManager.objects[player] then
+                    ESPManager:CreateESP(player)
+                end
+                pcall(function()
+                    ESPManager:UpdateESP(player, ESPManager.objects[player])
+                end)
+            end
+        end
+        lastESP = now
+    end
+end))
+
+ConnectionManager:Add("NoClip", RunService.Stepped:Connect(function()
+    if noclip then
+        local char = LocalPlayer.Character
+        if char then
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then part.CanCollide = false end
+            end
+        end
+    end
+end))
+
+ConnectionManager:Add("CharAdded", LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    if flyEnabled then
+        flyEnabled = false
+        MovementController:StopFly()
+    end
+end))
+
+ConnectionManager:Add("PlayerRemoving", Players.PlayerRemoving:Connect(function(player)
+    ESPManager:RemoveESP(player)
+end))
+
+UI.Success("E.V.E Private", "Loaded successfully! Hold RMB to aim.")
+print("E.V.E Private - XAN UI Edition - Loaded")
